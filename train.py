@@ -1,262 +1,66 @@
-#!/usr/bin/env python3
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
-import torch
-from apex import amp
-from torch import optim as Optimizer
-import numpy as np
-torch.manual_seed(1)
-from logger import setup_logger
+from synthesizer.hparams import hparams, get_image_list
+from synthesizer.train import tacotron_train
+from utils.argutils import print_args
+#from synthesizer import infolog
+import argparse
+from pathlib import Path
 import os
-import collections
-from torch.utils.data import DataLoader
-import hashlib
-import os
-import math
-import os.path as osp
-import logging
-import time
-import datetime
 
-from train_utils.tensorboard_logger import Tacotron2Logger
-from datasets import train_collate_fn_pad, FaceAugmentation 
-from datasets.grid import GRID
-from datasets.wild import WILD
-from datasets.lrw import LRW
-from datasets.avspeech import AVSpeech
-from evaluate import evaluate_net
-from train_utils.losses import *
-from model import model
-from hparams import create_hparams
-import arg_parser
+#Prepares the data.
+def prepare_run(args):
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = str(args.tf_log_level)
+    run_name = args.name
+    log_dir = os.path.join(args.models_dir, "logs-{}".format(run_name))
+    os.makedirs(log_dir, exist_ok=True)
+    all_images = get_image_list('train', args.data_root)
+    all_test_images = get_image_list('val', args.data_root)
 
+    hparams.add_hparam('all_images', all_images)
+    hparams.add_hparam('all_test_images', all_test_images)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Training on {} hours'.format(len(all_images) / (3600. * hparams.fps)))
+    print('Validating on {} hours'.format(len(all_test_images) / (3600. * hparams.fps)))
 
-
-class Logger:
-	logger = None
-	ModelSavePath = 'savedmodels'
-	tensor_board = None
-
-
-def set_model_logger(net):
-	model_info = str(net)
-
-
-	respth = f'{Logger.ModelSavePath}/{hashlib.md5(model_info.encode()).hexdigest()}'
-	Logger.ModelSavePath = respth
-
-	if not osp.exists(respth): os.makedirs(respth)
-	logger = logging.getLogger()
-
-	if setup_logger(respth):
-		logger.info(model_info)
-
-	Logger.logger = logger
-
-	tf_logs = f'{respth}/tf-logs'; os.makedirs(tf_logs, exist_ok=True)
-	Logger.tensor_board = Tacotron2Logger(tf_logs)
-
-
-def train(args):
-	dataset_name = args.dataset
-	dataset_path = args.dataset_path
-	
-	if dataset_name == 'LRW':
-		ds = LRW(dataset_path, face_augmentation=FaceAugmentation())
-		val_ds = LRW(dataset_path, mode='test', face_augmentation=FaceAugmentation())
-	elif dataset_name == 'GRID':
-		ds = GRID(dataset_path, face_augmentation=FaceAugmentation())
-		val_ds = LRW(dataset_path, mode='test', face_augmentation=FaceAugmentation())
-	elif dataset_name == 'AVSpeech':
-		ds = AVSpeech(dataset_path, face_augmentation=FaceAugmentation())
-		val_ds = LRW(dataset_path, mode='test', face_augmentation=FaceAugmentation())
-	elif dataset_name == 'WILD':
-		ds = WILD(dataset_path, face_augmentation=FaceAugmentation())
-		val_ds = LRW(dataset_path, mode='test', face_augmentation=FaceAugmentation())
-	else:
-		assert "Dataset Not Present"
-	
-	saved_path = args.finetune_model
-
-	
-	hparams = create_hparams()
-	
-	net = model.get_network('train').to(device)
-	set_model_logger(net)
-	
-	tf_ratio = 0.1
-	max_iter = 6400000
-	save_iter = 2000
-	n_img_per_gpu = hparams.batch_size
-	n_workers = min(n_img_per_gpu, os.cpu_count())
-	
-	dl = DataLoader(ds,
-					batch_size=n_img_per_gpu,
-					shuffle=False,
-					num_workers=n_workers,
-					pin_memory=True,
-					drop_last=False, 
-					collate_fn=train_collate_fn_pad)
-
-	optim = Optimizer.AdamW([{'params': net.decoder.parameters()},
-							 {'params': net.encoder.parameters()},
-							], lr=hparams.learning_rate, weight_decay=hparams.weight_decay, amsgrad=True)
-
-	if hparams.fp16_run:
-		net, optim = amp.initialize(net, optim, opt_level='O2')
-
-	max_eval_score = 0
-	start_it = 0
-	if os.path.isfile(saved_path):
-		state_dict = torch.load(saved_path, map_location=device)
-		if 'state_dict' in state_dict: state_dict = state_dict['state_dict']
-
-		try:
-			net.load_state_dict(state_dict, strict=False)
-		except RuntimeError as e:
-			print(e)
-		
-		try:
-			start_it = 0
-			start_it = state_dict['start_it'] + 2
-		except KeyError:
-			start_it = 0
-
-		try:
-			max_eval_score = state_dict['max_eval_score']
-		except KeyError: ...
-
-		try:
-			optim.load_state_dict(state_dict['optimize_state'])
-			...
-		except Exception as e: print(e)
-
-
-		print(f'Model Loaded: {saved_path} @ start_it: {start_it}')
-
-
-	reconstruction_criterion = Loss()
-	
-	## train loop
-	msg_iter = 50
-	loss_log = collections.defaultdict(float)
-	st = glob_st = time.time()
-	diter = iter(dl)
-	epoch = 0
-
-	batch = next(diter)
-
-	net = net.train()
-	for it in range(start_it, max_iter):
-		try:
-			batch = next(diter)
-		except StopIteration:
-			epoch += 1
-			diter = iter(dl)
-			batch = next(diter)
-
-			if epoch % 10 == 0:
-				tf_ratio += 0.1
-
-		(videos, video_lengths), (audios, audio_lengths), (melspecs, melspec_lengths, mel_gates), face_crops = batch
-	
-		videos, audios, melspecs, face_crops = videos.to(device), audios.to(device), melspecs.to(device), face_crops.to(device)
-		video_lengths, audio_lengths, melspec_lengths = video_lengths.to(device), audio_lengths.to(device), melspec_lengths.to(device)
-		mel_gates = mel_gates.to(device)
-		outputs = net(videos, face_crops, audios, melspecs, video_lengths, audio_lengths, melspec_lengths, tf_ratio)
-		
-		
-		losses = dict()
-
-		losses = reconstruction_criterion(outputs, (melspecs, mel_gates), losses)
-
-		loss = sum(losses.values())
-		losses['loss'] = loss
-
-
-		optim.zero_grad()
-
-		if hparams.fp16_run:
-			with amp.scale_loss(loss, optim) as scaled_loss:
-				scaled_loss.backward()
-		else:
-			loss.backward()
-
-		if hparams.fp16_run:
-			grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optim), hparams.grad_clip_thresh)
-			is_overflow = math.isnan(grad_norm)
-		else:
-			is_overflow = False
-			grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), hparams.grad_clip_thresh)
-		
-		optim.step()
-	
-	
-		if is_overflow: continue
-
-		for k, v in losses.items(): loss_log[k] += v.item()
-		if (it + 1) % save_iter == 0:
-			save_pth = osp.join(Logger.ModelSavePath, f'{it + 1}_{int(time.time())}.pth')
-
-			eval_score = evaluate_net(net, val_ds)
-			
-			Logger.logger.info(f"Model@{it + 1}\n Evaluation score: {eval_score}")
-			Logger.tensor_board.log_validation(eval_score, net, (melspecs, mel_gates), outputs, it + 1)
-
-			if eval_score < max_eval_score:  
-				print(f'Saving model at: {(it + 1)}, save_pth: {save_pth}')
-				torch.save({
-					'start_it': it,
-					'state_dict': net.state_dict(),
-					'optimize_state': optim.state_dict(),
-					'max_eval_score': max_eval_score,
-				}, save_pth)
-				print(f'model at: {(it + 1)} Saved')
-
-				max_eval_score = eval_score
-
-		#   print training log message
-		if (it+1) % msg_iter == 0:
-			for k, v in loss_log.items(): loss_log[k] = round(v / msg_iter, 2)
-
-			ed = time.time()
-			t_intv, glob_t_intv = ed - st, ed - glob_st
-			eta = int((max_iter - it) * (glob_t_intv / it))
-			eta = str(datetime.timedelta(seconds=eta))
-			msg = ', '.join([
-					f'epoch: {epoch}',
-					'it: {it}/{max_it}',         
-					*[f"{k}: {v}" for k, v in loss_log.items()],
-					f'tf_ratio: {tf_ratio}',
-					'eta: {eta}',
-					'time: {time:.2f}',
-				]).format(
-					it = it+1,
-					max_it = max_iter,
-					time = t_intv,
-					eta = eta
-				)
-			Logger.tensor_board.log_training(loss_log['loss'], grad_norm, hparams.learning_rate, t_intv, it + 1)
-			Logger.logger.info(msg)
-
-			Logger.tensor_board.log_predictions(outputs, (melspecs, mel_gates))
-			Logger.tensor_board.log_alignment(F.softmax(outputs[4], dim=-1), it + 1)
-			
-			loss_log = collections.defaultdict(float)
-			st = ed
-
-	save_pth = osp.join(Logger.ModelSavePath, 'model_final.pth')
-	net.cpu()
-	torch.save({'state_dict': net.state_dict()}, save_pth)
-
-	Logger.logger.info('training done, model saved to: {}'.format(save_pth))
-
-
-def main():
-	args = arg_parser.train()
-	train(args)
-
+    return log_dir, hparams
 
 if __name__ == "__main__":
-	main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("name", help="Name of the run and of the logging directory.")
+    parser.add_argument("--data_root", help="Speaker folder path", required=True)
+    parser.add_argument("--preset", help="Speaker-specific hyper-params", type=str, required=True)
+
+    parser.add_argument("-m", "--models_dir", type=str, default="synthesizer/saved_models/", help=\
+        "Path to the output directory that will contain the saved model weights and the logs.")
+
+    parser.add_argument("--mode", default="synthesis",
+                        help="mode for synthesis of tacotron after training")
+    
+    parser.add_argument("--GTA", default="True",
+                        help="Ground truth aligned synthesis, defaults to True, only considered "
+							 "in Tacotron synthesis mode")
+    parser.add_argument("--restore", type=bool, default=True,
+                        help="Set this to False to do a fresh training")
+    parser.add_argument("--summary_interval", type=int, default=2500,
+                        help="Steps between running summary ops")
+    parser.add_argument("--embedding_interval", type=int, default=1000000000,
+                        help="Steps between updating embeddings projection visualization")
+    parser.add_argument("--checkpoint_interval", type=int, default=1000, # Was 5000
+                        help="Steps between writing checkpoints")
+    parser.add_argument("--eval_interval", type=int, default=1000, # Was 10000
+                        help="Steps between eval on test data")
+    parser.add_argument("--tacotron_train_steps", type=int, default=2000000, # Was 100000
+                        help="total number of tacotron training steps")
+    parser.add_argument("--tf_log_level", type=int, default=1, help="Tensorflow C++ log level.")
+
+    args = parser.parse_args()
+    print_args(args, parser)
+    
+    log_dir, hparams = prepare_run(args)
+    
+    with open(args.preset) as f:
+        hparams.parse_json(f.read())
+
+    tacotron_train(args, log_dir, hparams)
